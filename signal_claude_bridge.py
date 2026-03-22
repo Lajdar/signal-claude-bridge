@@ -3,7 +3,7 @@
 
 Connects to signal-cli's JSON-RPC daemon via TCP socket,
 listens for incoming messages from whitelisted numbers,
-dispatches them to Claude Code's network-stremio-fixer agent,
+dispatches them to a Claude Code agent,
 and sends responses back via Signal.
 """
 
@@ -17,6 +17,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path.home() / ".config" / "system-config.json"
 
@@ -35,8 +39,18 @@ DEFAULT_CONFIG = {
 
 logger = logging.getLogger("signal-claude-bridge")
 
-# Serialize Claude invocations so only one runs at a time on the Pi
-claude_semaphore = threading.Semaphore(1)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+MAX_BUFFER_SIZE = 1_048_576  # 1 MB — prevent unbounded memory growth
+RECV_CHUNK_SIZE = 4096
+CONNECT_TIMEOUT = 10  # seconds
+RPC_TIMEOUT = 30  # seconds
+LISTEN_SOCKET_TIMEOUT = 5  # seconds
+MIN_BACKOFF = 5  # seconds
+MAX_BACKOFF = 300  # seconds (5 min)
+RATE_LIMIT_CLEANUP_THRESHOLD = 100
 
 
 def load_config() -> dict:
@@ -46,7 +60,9 @@ def load_config() -> dict:
     return {**DEFAULT_CONFIG, **full_config.get("signal_claude_bridge", {})}
 
 
-MAX_BUFFER_SIZE = 1 * 1024 * 1024  # 1 MB — prevent unbounded memory growth
+# ---------------------------------------------------------------------------
+# JSON-RPC Client
+# ---------------------------------------------------------------------------
 
 
 class SignalRpcClient:
@@ -60,7 +76,7 @@ class SignalRpcClient:
 
     def _connect(self) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
+        sock.settimeout(CONNECT_TIMEOUT)
         sock.connect((self.host, self.port))
         return sock
 
@@ -81,11 +97,10 @@ class SignalRpcClient:
             }
             sock.sendall((json.dumps(request) + "\n").encode())
 
-            # Read response (newline-delimited)
-            sock.settimeout(30)
+            sock.settimeout(RPC_TIMEOUT)
             buf = b""
             while b"\n" not in buf:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(RECV_CHUNK_SIZE)
                 if not chunk:
                     raise ConnectionError("signal-cli socket closed")
                 buf += chunk
@@ -97,7 +112,19 @@ class SignalRpcClient:
             sock.close()
 
 
+# ---------------------------------------------------------------------------
+# Bridge
+# ---------------------------------------------------------------------------
+
+
 class SignalClaudeBridge:
+    """Bridge between Signal Messenger and Claude Code AI agents.
+
+    Listens for incoming Signal messages from whitelisted senders,
+    invokes a Claude Code agent, and returns the response via Signal.
+    Handles rate limiting, input sanitization, and graceful shutdown.
+    """
+
     def __init__(self, config: dict):
         self.config = config
         self.rpc = SignalRpcClient(
@@ -106,7 +133,13 @@ class SignalClaudeBridge:
         )
         self.last_request_time: dict[str, float] = {}
         self.rate_lock = threading.Lock()
-        self.running = True
+        self.running = threading.Event()
+        self.running.set()
+        self._claude_semaphore = threading.Semaphore(1)
+        self._threads: list[threading.Thread] = []
+        self._threads_lock = threading.Lock()
+
+    # -- Formatting ----------------------------------------------------------
 
     @staticmethod
     def strip_markdown(text: str) -> str:
@@ -137,7 +170,9 @@ class SignalClaudeBridge:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def send_message(self, recipient: str, message: str):
+    # -- Messaging -----------------------------------------------------------
+
+    def send_message(self, recipient: str, message: str) -> None:
         """Send a Signal message, stripping markdown and truncating if needed."""
         message = self.strip_markdown(message)
         max_len = self.config["max_message_length"]
@@ -151,12 +186,13 @@ class SignalClaudeBridge:
                 "account": self.config["account_number"],
             })
         except Exception as e:
-            logger.error("Failed to send message to %s: %s", recipient, e)
+            logger.error(f"Failed to send message to {self._redact_number(recipient)}: {e}")
+
+    # -- Input handling ------------------------------------------------------
 
     @staticmethod
     def sanitize_input(message: str, max_length: int) -> str:
         """Sanitize user input: strip control characters and enforce length limit."""
-        # Remove control characters except newlines and tabs
         message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
         if len(message) > max_length:
             message = message[:max_length]
@@ -191,7 +227,7 @@ class SignalClaudeBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                cwd="/root",
+                cwd=str(Path.home()),
             )
 
             start_time = time.time()
@@ -215,12 +251,14 @@ class SignalClaudeBridge:
             output = proc.stdout.read().strip()
             if proc.returncode != 0 and not output:
                 stderr_snippet = proc.stderr.read().strip()[:200]
-                logger.warning("Claude exited %d: %s", proc.returncode, stderr_snippet)
+                logger.warning(f"Claude exited {proc.returncode}: {stderr_snippet}")
                 output = "Something went wrong processing your request. Try again shortly."
             return output or "No output from Claude."
         except Exception as e:
-            logger.error("Failed to invoke Claude: %s", e)
+            logger.error(f"Failed to invoke Claude: {e}")
             return "Failed to process your request. The system may need attention."
+
+    # -- Rate limiting -------------------------------------------------------
 
     def is_rate_limited(self, sender: str) -> bool:
         """Check if sender is within cooldown period."""
@@ -231,7 +269,15 @@ class SignalClaudeBridge:
             if now - last < cooldown:
                 return True
             self.last_request_time[sender] = now
+            # Prevent unbounded growth: prune expired entries periodically
+            if len(self.last_request_time) > RATE_LIMIT_CLEANUP_THRESHOLD:
+                cutoff = now - cooldown
+                expired = [k for k, v in self.last_request_time.items() if v < cutoff]
+                for k in expired:
+                    del self.last_request_time[k]
             return False
+
+    # -- Logging helpers -----------------------------------------------------
 
     @staticmethod
     def _redact_number(number: str) -> str:
@@ -240,7 +286,9 @@ class SignalClaudeBridge:
             return number[:4] + "X" * (len(number) - 7) + number[-3:]
         return "REDACTED"
 
-    def handle_message(self, sender: str, message: str):
+    # -- Message handling ----------------------------------------------------
+
+    def handle_message(self, sender: str, message: str) -> None:
         """Process an incoming message and send response."""
         whitelist = self.config["whitelisted_numbers"]
         if whitelist and sender not in whitelist:
@@ -252,90 +300,100 @@ class SignalClaudeBridge:
             return
 
         redacted = self._redact_number(sender)
-        logger.info("Processing from %s (%d chars)", redacted, len(message))
+        logger.info(f"Processing from {redacted} ({len(message)} chars)")
         self.send_message(sender, "Received. Running diagnostics...")
 
-        # Serialize Claude runs to avoid overloading the Pi
-        with claude_semaphore:
+        with self._claude_semaphore:
             response = self.invoke_claude(message, sender=sender)
 
         self.send_message(sender, response)
-        logger.info("Sent response to %s (%d chars)", redacted, len(response))
+        logger.info(f"Sent response to {redacted} ({len(response)} chars)")
 
-    def listen(self):
-        """Main loop: connect to signal-cli TCP daemon and listen for messages."""
-        while self.running:
+    # -- Notification parsing ------------------------------------------------
+
+    def _process_notification(self, msg: dict) -> None:
+        """Parse a JSON-RPC notification and dispatch valid messages."""
+        if msg.get("method") != "receive":
+            return
+
+        envelope = msg.get("params", {}).get("envelope", {})
+        sender = envelope.get("sourceNumber", "")
+        if not isinstance(sender, str) or not sender.startswith("+"):
+            return
+
+        body = ""
+
+        # Case 1: Direct message from someone else
+        data_message = envelope.get("dataMessage")
+        if data_message:
+            body = data_message.get("message", "")
+
+        # Case 2: Sync message (Note to Self / sent from primary device)
+        sync_message = envelope.get("syncMessage", {}).get("sentMessage")
+        if sync_message and not body:
+            body = sync_message.get("message", "")
+            dest = sync_message.get("destinationNumber", "")
+            if dest and dest != sender:
+                body = ""
+
+        if sender and body:
+            t = threading.Thread(
+                target=self.handle_message,
+                args=(sender, body),
+                daemon=True,
+            )
+            with self._threads_lock:
+                self._threads = [t for t in self._threads if t.is_alive()]
+                self._threads.append(t)
+            t.start()
+
+    # -- Main listener loop --------------------------------------------------
+
+    def listen(self) -> None:
+        """Connect to signal-cli TCP daemon and listen for messages."""
+        backoff = MIN_BACKOFF
+
+        while self.running.is_set():
             sock = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)
+                sock.settimeout(LISTEN_SOCKET_TIMEOUT)
                 sock.connect((
                     self.config["signal_cli_socket_host"],
                     self.config["signal_cli_socket_port"],
                 ))
                 logger.info(
-                    "Connected to signal-cli at %s:%d",
-                    self.config["signal_cli_socket_host"],
-                    self.config["signal_cli_socket_port"],
+                    f"Connected to signal-cli at "
+                    f"{self.config['signal_cli_socket_host']}:{self.config['signal_cli_socket_port']}"
                 )
+                backoff = MIN_BACKOFF  # reset on successful connection
 
                 buf = b""
-                while self.running:
+                while self.running.is_set():
                     try:
-                        chunk = sock.recv(4096)
+                        chunk = sock.recv(RECV_CHUNK_SIZE)
                     except socket.timeout:
                         continue
                     if not chunk:
                         raise ConnectionError("Socket closed")
                     buf += chunk
                     if len(buf) > MAX_BUFFER_SIZE:
-                        logger.warning("Listener buffer exceeded limit, resetting")
-                        buf = b""
-                        continue
+                        raise ConnectionError("Listener buffer exceeded limit")
 
-                    # Process complete JSON lines
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         if not line.strip():
                             continue
-
                         try:
                             msg = json.loads(line.decode())
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
-
-                        # JSON-RPC notification for received message
-                        if msg.get("method") == "receive":
-                            envelope = msg.get("params", {}).get("envelope", {})
-                            sender = envelope.get("sourceNumber", "")
-                            body = ""
-
-                            # Case 1: Direct message from someone else
-                            data_message = envelope.get("dataMessage")
-                            if data_message:
-                                body = data_message.get("message", "")
-
-                            # Case 2: Sync message (Note to Self / sent from primary device)
-                            sync_message = envelope.get("syncMessage", {}).get("sentMessage")
-                            if sync_message and not body:
-                                body = sync_message.get("message", "")
-                                # For Note to Self, destination == source
-                                dest = sync_message.get("destinationNumber", "")
-                                if dest and dest != sender:
-                                    # This is a sync of a message sent to someone else, skip
-                                    body = ""
-
-                            if sender and body:
-                                threading.Thread(
-                                    target=self.handle_message,
-                                    args=(sender, body),
-                                    daemon=True,
-                                ).start()
+                        self._process_notification(msg)
 
             except (ConnectionError, OSError) as e:
-                logger.warning("Connection error: %s. Reconnecting in 10s...", e)
-            except Exception as e:
-                logger.exception("Unexpected error: %s", e)
+                logger.warning(f"Connection error: {e}. Reconnecting in {backoff}s...")
+            except Exception:
+                logger.exception("Unexpected error in listener")
             finally:
                 if sock:
                     try:
@@ -343,8 +401,27 @@ class SignalClaudeBridge:
                     except OSError:
                         pass
 
-            if self.running:
-                time.sleep(10)
+            if self.running.is_set():
+                self.running.wait(timeout=backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+
+    # -- Shutdown ------------------------------------------------------------
+
+    def shutdown(self, timeout: float = 15.0) -> None:
+        """Stop listening and wait for in-flight message handlers to finish."""
+        self.running.clear()
+        with self._threads_lock:
+            threads = list(self._threads)
+        deadline = time.time() + timeout
+        for t in threads:
+            remaining = deadline - time.time()
+            if remaining > 0:
+                t.join(timeout=remaining)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -365,16 +442,16 @@ def main():
 
     bridge = SignalClaudeBridge(config)
 
-    def shutdown(signum, frame):
+    def on_signal(signum, frame):
         logger.info("Shutting down...")
-        bridge.running = False
-        sys.exit(0)
+        bridge.shutdown()
 
-    signal.signal(signal.SIGTERM, shutdown)
-    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
 
-    logger.info("Signal-Claude bridge starting (agent: %s)", config["agent"])
+    logger.info(f"Signal-Claude bridge starting (agent: {config['agent']})")
     bridge.listen()
+    logger.info("Bridge stopped.")
 
 
 if __name__ == "__main__":
