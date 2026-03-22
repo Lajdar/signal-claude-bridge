@@ -1,0 +1,17 @@
+[Unit]
+Description=signal-cli JSON-RPC Daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+SyslogIdentifier=signal-cli-daemon
+Type=simple
+# Replace YOUR_ACCOUNT_NUMBER with your registered Signal number (e.g. +1234567890)
+ExecStart=/usr/local/bin/signal-cli -a YOUR_ACCOUNT_NUMBER --output=json daemon --tcp 127.0.0.1:7583 --ignore-stories --ignore-avatars --ignore-stickers
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+Environment="JAVA_OPTS=-Xmx256m"
+
+[Install]
+WantedBy=multi-user.target

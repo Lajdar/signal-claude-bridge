@@ -1,0 +1,21 @@
+[Unit]
+Description=Signal-to-Claude-Code Bridge
+Wants=network-online.target
+After=network-online.target signal-cli-daemon.service
+Requires=signal-cli-daemon.service
+
+[Service]
+SyslogIdentifier=signal-claude-bridge
+Type=simple
+# Adjust WorkingDirectory and ExecStart to your installation path
+WorkingDirectory=/opt/signal-claude-bridge
+ExecStart=/usr/bin/python3 /opt/signal-claude-bridge/signal_claude_bridge.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+# Ensure claude CLI is in PATH
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+Environment="HOME=%h"
+
+[Install]
+WantedBy=multi-user.target

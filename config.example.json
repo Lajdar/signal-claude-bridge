@@ -1,0 +1,14 @@
+{
+  "signal_claude_bridge": {
+    "account_number": "+1234567890",
+    "whitelisted_numbers": ["+1234567890"],
+    "signal_cli_socket_host": "127.0.0.1",
+    "signal_cli_socket_port": 7583,
+    "claude_timeout_seconds": 120,
+    "max_message_length": 4000,
+    "cooldown_seconds": 30,
+    "agent": "your-agent-name",
+    "max_input_length": 1000,
+    "progress_interval_seconds": 30
+  }
+}
