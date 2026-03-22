@@ -57,7 +57,12 @@ def load_config() -> dict:
     """Load bridge config from system-config.json under 'signal_claude_bridge' key."""
     with open(CONFIG_PATH) as f:
         full_config = json.load(f)
-    return {**DEFAULT_CONFIG, **full_config.get("signal_claude_bridge", {})}
+    config = {**DEFAULT_CONFIG, **full_config.get("signal_claude_bridge", {})}
+    # Coerce numeric fields that may arrive as strings from hand-edited JSON
+    for key, default in DEFAULT_CONFIG.items():
+        if isinstance(default, int) and not isinstance(config[key], int):
+            config[key] = int(config[key])
+    return config
 
 
 # ---------------------------------------------------------------------------
