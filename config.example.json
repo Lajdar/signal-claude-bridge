@@ -7,8 +7,19 @@
     "claude_timeout_seconds": 120,
     "max_message_length": 4000,
     "cooldown_seconds": 30,
-    "agent": "your-agent-name",
     "max_input_length": 1000,
-    "progress_interval_seconds": 30
+    "progress_interval_seconds": 30,
+
+    "_comment_agent": "Optional: name of a Claude Code agent to use (omit to use default claude behavior)",
+    "agent": "",
+
+    "_comment_received_message": "Acknowledgment sent to the user when their message is received",
+    "received_message": "Received. Processing...",
+
+    "_comment_prompt_prefix": "Injected before the user's message to frame it as untrusted input. Customize to match your agent's scope.",
+    "prompt_prefix": "",
+
+    "_comment_bridge_settings_path": "Optional: path to a Claude Code settings.json with a permission allowlist for the bridge subprocess. When set, the bridge ignores ~/.claude/settings*.json and uses only this file.",
+    "bridge_settings_path": ""
   }
 }
