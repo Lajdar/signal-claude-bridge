@@ -24,8 +24,9 @@ Signal App                signal-cli daemon            this bridge              
 - **Single file** — the entire bridge is one ~450-line Python script
 - **Agent-agnostic** — works with any Claude Code agent, or none (uses default Claude behavior)
 - **Whitelist access control** — only configured phone numbers get responses
-- **Input sanitization** — control characters stripped, message length enforced
+- **Input sanitization** — control characters stripped, XML tag breakout prevented, message length enforced
 - **Prompt injection mitigation** — user input wrapped in untrusted delimiters with scope enforcement
+- **Config validation** — agent names validated, broad permission patterns flagged at startup
 - **Isolated permissions** — optional dedicated settings file keeps bridge permissions separate from your interactive Claude config
 - **Rate limiting** — per-sender cooldown prevents abuse
 - **Progress notifications** — periodic "Still working..." messages during long runs
@@ -111,32 +112,19 @@ The `prompt_prefix` is prepended to every user message before it reaches Claude.
 
 Set `bridge_settings_path` to a JSON file containing a Claude Code permission allowlist. When set, the bridge subprocess ignores your `~/.claude/settings.json` and `settings.local.json`, using only the specified file. This lets you keep broad permissions for interactive use while locking down the automated bridge.
 
-Example `/etc/signal-claude-bridge/claude-settings.json`:
-```json
-{
-  "permissions": {
-    "defaultMode": "auto",
-    "allow": [
-      "Bash(docker ps:*)",
-      "Bash(curl:*)",
-      "Bash(systemctl status:*)",
-      "Read(*)",
-      "Glob(*)",
-      "Grep(*)"
-    ],
-    "deny": [
-      "Bash(sudo:*)",
-      "Bash(rm -rf:*)",
-      "Bash(apt:*)"
-    ]
-  }
-}
+A generic template is included in the repo — copy and customize it for your deployment:
+
+```bash
+cp bridge-settings.example.json /etc/signal-claude-bridge/claude-settings.json
+# Edit the allow/deny lists to match your agent's scope
 ```
+
+**Important:** Scope `Read`, `Edit`, and `Write` permissions to specific directories rather than using wildcards like `Write(*)`. The bridge will warn at startup if it detects overly broad permission patterns. See `bridge-settings.example.json` for the recommended structure.
 
 ## How It Works
 
-1. The bridge connects to signal-cli's TCP JSON-RPC daemon and listens for `receive` notifications
-2. When a message arrives from a whitelisted sender, it's sanitized and rate-checked
+1. The bridge validates config at startup (agent name format, settings file permissions) and connects to signal-cli's TCP JSON-RPC daemon
+2. When a message arrives from a whitelisted sender, it's sanitized (control chars, XML tag breakout, length) and rate-checked
 3. The message is wrapped with the prompt prefix and passed to Claude Code CLI as a subprocess
 4. While Claude is working, periodic progress updates are sent back to the user
 5. Claude's response is stripped of markdown formatting and sent back via Signal
@@ -154,14 +142,16 @@ The bridge handles both direct messages and "Note to Self" sync messages, so you
 ## Security Considerations
 
 - **Whitelist-only access** — the bridge refuses to process messages from numbers not in the whitelist and won't start with an empty whitelist
-- **Input sanitization** — control characters are stripped, message length is capped
-- **Prompt injection mitigation** — user input is wrapped in `<user_message>` tags with explicit instructions to treat it as untrusted
+- **Input sanitization** — control characters are stripped, `<user_message>` tag breakout is prevented, message length is capped
+- **Prompt injection mitigation** — user input is wrapped in `<user_message>` tags with explicit instructions to treat it as untrusted; a `--` separator prevents prompt content from being interpreted as CLI flags
+- **Config validation** — agent names are validated against `^[a-zA-Z0-9_-]+$` to prevent injection; the bridge refuses to start with an invalid agent name
+- **Permission auditing** — at startup, the bridge parses the settings file and warns about overly broad permissions (`Write(*)`, `Bash(curl:*)`, etc.)
 - **Permission isolation** — optional dedicated settings file prevents the bridge from inheriting broad interactive permissions
 - **No shell execution** — Claude is invoked via `subprocess.Popen` with an argv list, not through a shell
-- **Rate limiting** — prevents any single sender from flooding the system
-- **Log redaction** — phone numbers are redacted in log output
+- **Rate limiting** — prevents any single sender from flooding the system; rate-limited senders receive no response (no information leak)
+- **Log redaction** — phone numbers are redacted in log output; agent names are repr-escaped to prevent log injection
 - **Error sanitization** — internal errors are not exposed to Signal users
-- **Recommendation:** run the bridge as a non-root user and restrict `~/.config/system-config.json` to mode `0600`
+- **Recommendation:** run the bridge as a non-root user and restrict `~/.config/system-config.json` to mode `0600` (or root-owned `0640` if the service runs as a dedicated user)
 - **Recommendation:** always set `bridge_settings_path` to isolate the bridge's permissions from your interactive Claude config
 
 ## License
