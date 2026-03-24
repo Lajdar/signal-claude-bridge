@@ -13,5 +13,23 @@ RestartSec=10
 TimeoutStopSec=20
 Environment="JAVA_OPTS=-Xmx256m"
 
+# Security hardening — restrict what signal-cli can access
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Java JIT requires write+execute memory
+MemoryDenyWriteExecute=no
+# signal-cli needs to write its database; adjust path if your data dir differs
+ReadWritePaths=%h/.local/share/signal-cli
+
 [Install]
 WantedBy=multi-user.target

@@ -17,5 +17,27 @@ TimeoutStopSec=30
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 Environment="HOME=%h"
 
+# Security hardening — restrict what the bridge process can access
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# Claude's Bun runtime and Java both require JIT compilation
+MemoryDenyWriteExecute=no
+# Adjust these paths to match your deployment:
+# - Claude subprocess needs read-write access to its data directory
+# - Add any directories your agent needs to write to
+ReadWritePaths=%h/.claude
+# - Config and bridge settings should be read-only at runtime
+ReadOnlyPaths=%h/.config/system-config.json
+
 [Install]
 WantedBy=multi-user.target
