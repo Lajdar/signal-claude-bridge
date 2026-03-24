@@ -1,0 +1,46 @@
+{
+  "_comment": "Example Claude Code permission settings for the bridge subprocess. Copy this file, customize the allow/deny lists for your agent's scope, and set bridge_settings_path in your config to point to it. See: https://docs.anthropic.com/en/docs/claude-code/settings",
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Bash(docker ps:*)",
+      "Bash(docker logs:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker stats:*)",
+      "Bash(systemctl status:*)",
+      "Bash(journalctl:*)",
+      "Bash(ping:*)",
+      "Bash(dig:*)",
+      "Bash(ip addr:*)",
+      "Bash(ip route:*)",
+      "Bash(ss:*)",
+      "Read(/path/to/your/app/config/*)",
+      "Glob(/path/to/your/app/*)",
+      "Grep(/path/to/your/app/*)",
+      "Edit(/path/to/your/app/config/*)",
+      "Write(/path/to/your/app/config/*)"
+    ],
+    "deny": [
+      "Bash(sudo:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(chmod:*)",
+      "Bash(chown:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(bash:*)",
+      "Bash(sh:*)",
+      "Bash(nc:*)",
+      "Bash(apt:*)",
+      "Bash(pip:*)",
+      "Bash(systemctl daemon-reload:*)",
+      "Bash(systemctl enable:*)",
+      "Bash(systemctl disable:*)",
+      "Bash(docker run:*)",
+      "Bash(docker build:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker rmi:*)",
+      "NotebookEdit(*)"
+    ]
+  }
+}

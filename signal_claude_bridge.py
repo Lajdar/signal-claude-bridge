@@ -64,6 +64,9 @@ MAX_BACKOFF = 300  # seconds (5 min)
 RATE_LIMIT_CLEANUP_THRESHOLD = 100
 
 
+VALID_AGENT_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
 def load_config() -> dict:
     """Load bridge config from system-config.json under 'signal_claude_bridge' key."""
     with open(CONFIG_PATH) as f:
@@ -74,6 +77,56 @@ def load_config() -> dict:
         if isinstance(default, int) and not isinstance(config[key], int):
             config[key] = int(config[key])
     return config
+
+
+def validate_agent_name(name: str) -> bool:
+    """Validate agent name contains only safe characters."""
+    return bool(VALID_AGENT_RE.match(name))
+
+
+# Patterns in Claude settings permissions that are overly broad for a bridge subprocess.
+# Each tuple is (pattern_substring, human-readable warning).
+_BROAD_PERMISSION_PATTERNS = [
+    ("Edit(*)", "Edit(*) allows modifying any file — scope to specific directories"),
+    ("Write(*)", "Write(*) allows creating any file — scope to specific directories"),
+    ("Read(*)", "Read(*) allows reading any file — scope to specific directories"),
+    ("Bash(*)", "Bash(*) allows arbitrary shell commands — scope to specific commands"),
+    ("Bash(curl:*)", "Bash(curl:*) allows exfiltrating data to any URL — scope to specific hosts"),
+    ("Bash(wget:*)", "Bash(wget:*) allows downloading from any URL — scope to specific hosts"),
+]
+
+
+def audit_bridge_settings(path: str) -> None:
+    """Parse a bridge settings file and log warnings for overly broad permissions.
+
+    Non-blocking — logs warnings but does not prevent startup.
+    """
+    try:
+        with open(path) as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not parse bridge settings for audit: {e}")
+        return
+
+    allow_list = settings.get("permissions", {}).get("allow", [])
+    if not isinstance(allow_list, list):
+        return
+
+    warnings = []
+    for entry in allow_list:
+        if not isinstance(entry, str):
+            continue
+        for pattern, message in _BROAD_PERMISSION_PATTERNS:
+            if entry == pattern:
+                warnings.append(message)
+
+    if warnings:
+        logger.warning(
+            "Bridge settings contain broad permissions — "
+            "consider scoping for production use:"
+        )
+        for w in warnings:
+            logger.warning(f"  - {w}")
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +261,10 @@ class SignalClaudeBridge:
 
     @staticmethod
     def sanitize_input(message: str, max_length: int) -> str:
-        """Sanitize user input: strip control characters and enforce length limit."""
+        """Sanitize user input: strip control characters, XML tag breakout, and enforce length limit."""
         message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
+        # Prevent breakout from <user_message> XML framing (case-insensitive)
+        message = re.sub(r"</?user_message>", "", message, flags=re.IGNORECASE)
         if len(message) > max_length:
             message = message[:max_length]
         return message.strip()
@@ -241,7 +296,7 @@ class SignalClaudeBridge:
         settings_path = self.config.get("bridge_settings_path", "")
         if settings_path:
             cmd += ["--setting-sources", "", "--settings", settings_path]
-        cmd.append(prompt)
+        cmd += ["--", prompt]
 
         try:
             proc = subprocess.Popen(
@@ -314,12 +369,12 @@ class SignalClaudeBridge:
     def handle_message(self, sender: str, message: str) -> None:
         """Process an incoming message and send response."""
         whitelist = self.config["whitelisted_numbers"]
-        if whitelist and sender not in whitelist:
+        if sender not in whitelist:
             logger.info("Ignoring message from non-whitelisted sender")
             return
 
         if self.is_rate_limited(sender):
-            self.send_message(sender, "Please wait before sending another request.")
+            logger.info(f"Rate-limited {self._redact_number(sender)}")
             return
 
         redacted = self._redact_number(sender)
@@ -366,7 +421,7 @@ class SignalClaudeBridge:
                 daemon=True,
             )
             with self._threads_lock:
-                self._threads = [t for t in self._threads if t.is_alive()]
+                self._threads = [th for th in self._threads if th.is_alive()]
                 self._threads.append(t)
             t.start()
 
@@ -463,10 +518,17 @@ def main():
         logger.error("whitelisted_numbers is empty — refusing to start (security)")
         sys.exit(1)
 
-    settings_path = config.get("bridge_settings_path", "")
-    if settings_path and not Path(settings_path).is_file():
-        logger.error(f"bridge_settings_path not found: {settings_path}")
+    agent = config.get("agent", "")
+    if agent and not validate_agent_name(agent):
+        logger.error("Invalid agent name — must be alphanumeric, hyphens, or underscores only")
         sys.exit(1)
+
+    settings_path = config.get("bridge_settings_path", "")
+    if settings_path:
+        if not Path(settings_path).is_file():
+            logger.error(f"bridge_settings_path not found: {settings_path}")
+            sys.exit(1)
+        audit_bridge_settings(settings_path)
 
     bridge = SignalClaudeBridge(config)
 
@@ -477,7 +539,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    logger.info(f"Signal-Claude bridge starting (agent: {config['agent']})")
+    logger.info(f"Signal-Claude bridge starting (agent: {config['agent']!r})")
     bridge.listen()
     logger.info("Bridge stopped.")
 
